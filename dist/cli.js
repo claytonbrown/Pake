@@ -20,7 +20,7 @@ import { InvalidArgumentError, program as program$1, Option } from 'commander';
 import fs$1 from 'fs';
 
 var name = "pake-cli";
-var version = "3.11.8";
+var version = "3.11.9";
 var description = "🤱🏻 Turn any webpage into a desktop app with one command. 🤱🏻 一键打包网页生成轻量桌面应用。";
 var engines = {
 	node: ">=18.0.0"
@@ -58,6 +58,7 @@ var scripts = {
 	analyze: "cd src-tauri && cargo bloat --release --crates",
 	tauri: "tauri",
 	cli: "cross-env NODE_ENV=development rollup -c -w",
+	"cli:dev": "cross-env NODE_ENV=development rollup -c -w",
 	"cli:build": "cross-env NODE_ENV=production rollup -c",
 	test: "pnpm run cli:build && cross-env PAKE_CREATE_APP=1 node tests/index.js",
 	format: "prettier --write . --ignore-unknown && find tests -name '*.js' -exec sed -i '' 's/[[:space:]]*$//' {} \\; && cd src-tauri && cargo fmt --verbose",
@@ -68,7 +69,7 @@ var scripts = {
 };
 var type = "module";
 var exports$1 = "./dist/cli.js";
-var license = "MIT";
+var license = "GPL-3.0-or-later";
 var dependencies = {
 	"@tauri-apps/api": "~2.10.1",
 	"@tauri-apps/cli": "^2.10.0",
@@ -409,6 +410,14 @@ function generateIdentifierSafeName(name) {
     return cleaned;
 }
 
+const LINUX_TARGET_TYPES = ['deb', 'appimage', 'rpm', 'zst'];
+// Returns the valid Linux build targets from a comma-separated targets
+// string, preserving LINUX_TARGET_TYPES order. Unknown entries are dropped.
+function filterLinuxTargets(targets) {
+    const requested = targets.split(',').map((target) => target.trim());
+    return LINUX_TARGET_TYPES.filter((target) => requested.includes(target));
+}
+
 /**
  * Pure transform from CLI options to the window-config slice that gets
  * merged into pake.json. Exposed for snapshot testing so option drift
@@ -534,18 +543,15 @@ Terminal=false
         [desktopInstallPath]: `assets/${desktopFileName}`,
     };
     const validTargets = [
-        'deb',
-        'appimage',
-        'rpm',
-        'deb-arm64',
-        'appimage-arm64',
-        'rpm-arm64',
+        ...LINUX_TARGET_TYPES,
+        ...LINUX_TARGET_TYPES.map((target) => `${target}-arm64`),
     ];
     const baseTarget = options.targets.includes('-arm64')
         ? options.targets.replace('-arm64', '')
         : options.targets;
     if (validTargets.includes(options.targets)) {
-        tauriConf.bundle.targets = [baseTarget];
+        // zst is repacked from the deb payload, so Tauri itself bundles a deb.
+        tauriConf.bundle.targets = [baseTarget === 'zst' ? 'deb' : baseTarget];
     }
     else {
         logger.warn(`✼ The target must be one of ${validTargets.join(', ')}, the default 'deb' will be used.`);
@@ -909,7 +915,8 @@ const APPIMAGE_FAILURE_GUIDANCE = `\n\n${APPIMAGE_BAR}\n` +
     '      Arch:    sudo pacman -S gdk-pixbuf2 librsvg\n' +
     '      Debian:  sudo apt install librsvg2-common gdk-pixbuf2.0-bin\n' +
     '      Fedora:  sudo dnf install gdk-pixbuf2-modules librsvg2\n' +
-    '      then:    gdk-pixbuf-query-loaders --update-cache\n' +
+    '      then:    sudo gdk-pixbuf-query-loaders --update-cache\n' +
+    '      (Arch refreshes the cache automatically via a pacman hook)\n' +
     '  • Running in Docker/container: AppImage needs /dev/fuse:\n' +
     '      --privileged --device /dev/fuse --security-opt apparmor=unconfined\n\n' +
     'Still stuck? Build a DEB instead: pake <url> --targets deb\n' +
@@ -989,7 +996,7 @@ class BaseBuilder {
         const command = `cd "${npmDirectory}" && ${packageManager} run tauri${argSeparator} dev --config "${configPath}" ${featureArgs}`;
         await shellExec(command);
     }
-    async buildAndCopy(url, target) {
+    async buildAndCopy(url, target, logSuccess = true) {
         const { name = 'pake-app' } = this.options;
         await mergeConfig(url, this.options, tauriConfig);
         const packageManager = await detectPackageManager();
@@ -1050,8 +1057,10 @@ class BaseBuilder {
             await this.copyRawBinary(npmDirectory, name);
         }
         await fsExtra.remove(appPath);
-        logger.success('✔ Build success!');
-        logger.success('✔ App installer located in', distPath);
+        if (logSuccess) {
+            logger.success('✔ Build success!');
+            logger.success('✔ App installer located in', distPath);
+        }
         // Log binary location if preserved
         if (this.options.keepBinary) {
             const binaryPath = this.getRawBinaryPath(name);
@@ -1394,21 +1403,123 @@ class LinuxBuilder extends BaseBuilder {
         return `${name}_${version}_${arch}`;
     }
     async build(url) {
-        const targetTypes = ['deb', 'appimage', 'rpm'];
-        const requestedTargets = this.options.targets
-            .split(',')
-            .map((t) => t.trim());
-        for (const target of targetTypes) {
-            if (requestedTargets.includes(target)) {
-                this.currentBuildType = target;
+        const targets = filterLinuxTargets(this.options.targets);
+        if (targets.length === 0) {
+            throw new Error(`No valid Linux target in "${this.options.targets}". Valid targets: ${LINUX_TARGET_TYPES.join(', ')}.`);
+        }
+        for (const target of targets) {
+            this.currentBuildType = target;
+            if (target === 'zst') {
+                await this.buildAndCopy(url, 'deb', false);
+                await this.createArchPackageFromDeb();
+            }
+            else {
                 await this.buildAndCopy(url, target);
             }
         }
     }
+    async ensureArchPackagingTools() {
+        const requiredTools = [
+            { tool: 'ar', pacmanPackage: 'binutils' },
+            { tool: 'bsdtar', pacmanPackage: 'libarchive' },
+        ];
+        for (const { tool, pacmanPackage } of requiredTools) {
+            try {
+                await shellExec(`command -v ${tool} >/dev/null 2>&1`);
+            }
+            catch {
+                throw new Error(`Building a zst package requires "${tool}". Install it first, e.g. "sudo pacman -S ${pacmanPackage}".`);
+            }
+        }
+    }
+    async createArchPackageFromDeb() {
+        const { name = 'pake-app' } = this.options;
+        const packageName = generateLinuxPackageName(name);
+        const version = tauriConfig.version;
+        const arch = this.buildArch === 'arm64' ? 'aarch64' : 'x86_64';
+        const debPath = path.resolve(`${name}.deb`);
+        const packagePath = path.resolve(`${name}-${version}-1-${arch}.pkg.tar.zst`);
+        const workDir = path.resolve('.pake-arch-package');
+        const dataDir = path.join(workDir, 'data');
+        const controlDir = path.join(workDir, 'control');
+        await this.ensureArchPackagingTools();
+        await fsExtra.remove(workDir);
+        await fsExtra.ensureDir(dataDir);
+        await fsExtra.ensureDir(controlDir);
+        try {
+            await shellExec(`cd "${controlDir}" && ar x "${debPath}"`);
+            const dataArchive = (await fsExtra.readdir(controlDir)).find((file) => file.startsWith('data.tar'));
+            if (!dataArchive) {
+                throw new Error(`Could not find data.tar payload in ${debPath}`);
+            }
+            await shellExec(`tar -xf "${path.join(controlDir, dataArchive)}" -C "${dataDir}"`);
+            // Drop the desktop entry auto-generated by the Tauri deb bundler;
+            // the payload already ships Pake's own com.pake.<name>.desktop.
+            await fsExtra.remove(path.join(dataDir, 'usr', 'share', 'applications', `${packageName}.desktop`));
+            const installedSize = await this.getDirectorySize(dataDir);
+            const pkgInfo = `pkgname = ${packageName}
+pkgbase = ${packageName}
+pkgver = ${version}-1
+pkgdesc = ${name} Pake app
+url = https://github.com/tw93/Pake
+builddate = ${Math.floor(Date.now() / 1000)}
+packager = Pake
+size = ${installedSize}
+arch = ${arch}
+license = custom
+depend = cairo
+depend = desktop-file-utils
+depend = gdk-pixbuf2
+depend = glib2
+depend = gtk3
+depend = hicolor-icon-theme
+depend = libsoup3
+depend = pango
+depend = webkit2gtk-4.1
+`;
+            await fsExtra.writeFile(path.join(dataDir, '.PKGINFO'), pkgInfo);
+            await fsExtra.writeFile(path.join(dataDir, '.INSTALL'), `post_install() {
+  gtk-update-icon-cache -q -t -f usr/share/icons/hicolor
+  update-desktop-database -q usr/share/applications
+}
+
+post_upgrade() {
+  post_install
+}
+
+post_remove() {
+  gtk-update-icon-cache -q -t -f usr/share/icons/hicolor
+  update-desktop-database -q usr/share/applications
+}
+`);
+            await shellExec(`bsdtar --zstd -cf "${packagePath}" -C "${dataDir}" .PKGINFO .INSTALL usr`);
+            await fsExtra.remove(debPath);
+            logger.success('✔ Build success!');
+            logger.success('✔ App installer located in', packagePath);
+        }
+        finally {
+            await fsExtra.remove(workDir);
+        }
+    }
+    async getDirectorySize(directory) {
+        let size = 0;
+        for (const entry of await fsExtra.readdir(directory, {
+            withFileTypes: true,
+        })) {
+            const entryPath = path.join(directory, entry.name);
+            if (entry.isDirectory()) {
+                size += await this.getDirectorySize(entryPath);
+            }
+            else if (entry.isFile()) {
+                size += (await fsExtra.stat(entryPath)).size;
+            }
+        }
+        return size;
+    }
     // Override buildAndCopy to ensure currentBuildType is synced if called directly, though the loop above handles it most of the time.
-    async buildAndCopy(url, target) {
+    async buildAndCopy(url, target, logSuccess = true) {
         this.currentBuildType = target;
-        await super.buildAndCopy(url, target);
+        await super.buildAndCopy(url, target, logSuccess);
     }
     getBuildCommand(packageManager = 'pnpm') {
         const configPath = path.join('src-tauri', '.pake', 'tauri.conf.json');
@@ -2430,8 +2541,11 @@ const DEFAULT_PAKE_OPTIONS = {
 
 function validateNumberInput(value) {
     const parsedValue = Number(value);
-    if (isNaN(parsedValue)) {
+    if (!Number.isFinite(parsedValue)) {
         throw new InvalidArgumentError('Not a number.');
+    }
+    if (parsedValue < 0) {
+        throw new InvalidArgumentError('Must not be negative.');
     }
     return parsedValue;
 }
@@ -2565,8 +2679,8 @@ ${green('|_|   \\__,_|_|\\_\\___|  can turn any webpage into a desktop app with 
         .addOption(new Option('--zoom <number>', 'Initial page zoom level (50-200)')
         .default(DEFAULT_PAKE_OPTIONS.zoom)
         .argParser((value) => {
-        const zoom = parseInt(value);
-        if (isNaN(zoom) || zoom < 50 || zoom > 200) {
+        const zoom = Number(value);
+        if (!Number.isFinite(zoom) || zoom < 50 || zoom > 200) {
             throw new Error('--zoom must be a number between 50 and 200');
         }
         return zoom;

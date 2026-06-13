@@ -42,7 +42,8 @@ const APPIMAGE_FAILURE_GUIDANCE =
   '      Arch:    sudo pacman -S gdk-pixbuf2 librsvg\n' +
   '      Debian:  sudo apt install librsvg2-common gdk-pixbuf2.0-bin\n' +
   '      Fedora:  sudo dnf install gdk-pixbuf2-modules librsvg2\n' +
-  '      then:    gdk-pixbuf-query-loaders --update-cache\n' +
+  '      then:    sudo gdk-pixbuf-query-loaders --update-cache\n' +
+  '      (Arch refreshes the cache automatically via a pacman hook)\n' +
   '  • Running in Docker/container: AppImage needs /dev/fuse:\n' +
   '      --privileged --device /dev/fuse --security-opt apparmor=unconfined\n\n' +
   'Still stuck? Build a DEB instead: pake <url> --targets deb\n' +
@@ -155,7 +156,7 @@ export default abstract class BaseBuilder {
     await shellExec(command);
   }
 
-  async buildAndCopy(url: string, target: string) {
+  async buildAndCopy(url: string, target: string, logSuccess = true) {
     const { name = 'pake-app' } = this.options;
     await mergeConfig(url, this.options, tauriConfig);
 
@@ -233,8 +234,10 @@ export default abstract class BaseBuilder {
     }
 
     await fsExtra.remove(appPath);
-    logger.success('✔ Build success!');
-    logger.success('✔ App installer located in', distPath);
+    if (logSuccess) {
+      logger.success('✔ Build success!');
+      logger.success('✔ App installer located in', distPath);
+    }
 
     // Log binary location if preserved
     if (this.options.keepBinary) {
